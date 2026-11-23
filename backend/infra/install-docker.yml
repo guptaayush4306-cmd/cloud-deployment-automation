@@ -1,0 +1,17 @@
+---
+- name: Install and start Docker
+  hosts: app
+  become: true
+
+  tasks:
+    - name: Install Docker from Ubuntu repositories
+      ansible.builtin.apt:
+        name: docker.io
+        state: present
+        update_cache: true
+
+    - name: Start Docker and enable it on boot
+      ansible.builtin.systemd_service:
+        name: docker
+        state: started
+        enabled: true

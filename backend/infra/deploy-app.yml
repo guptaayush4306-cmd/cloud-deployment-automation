@@ -1,0 +1,64 @@
+---
+- name: Deploy FastAPI application on EC2
+  hosts: app
+  become: true
+
+  vars:
+    aws_region: ap-south-1
+    ecr_registry: "910965283858.dkr.ecr.ap-south-1.amazonaws.com"
+    image_tag: "v1"
+
+  tasks:
+    - name: Install Python dependency for Docker modules
+      ansible.builtin.apt:
+        name: python3-requests
+        state: present
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: Ensure Docker is running
+      ansible.builtin.systemd_service:
+        name: docker
+        state: started
+        enabled: true
+
+    - name: Get ECR login token using EC2 IAM role
+      ansible.builtin.command:
+        cmd: /usr/local/bin/aws ecr get-login-password --region {{ aws_region }}
+      register: ecr_token
+      changed_when: false
+      no_log: true
+
+    - name: Log Docker into ECR
+      community.docker.docker_login:
+        registry_url: "{{ ecr_registry }}"
+        username: AWS
+        password: "{{ ecr_token.stdout }}"
+        reauthorize: true
+      no_log: true
+
+    - name: Pull image and ensure application container is running
+      community.docker.docker_container:
+        name: cloud-app
+        image: "{{ ecr_registry }}/cloud-deploy-app:{{ image_tag }}"
+        pull: always
+        state: started
+        restart_policy: unless-stopped
+        published_ports:
+          - "8000:8000"
+
+    - name: Wait for application health check
+      ansible.builtin.uri:
+        url: http://127.0.0.1:8000/health
+        status_code: 200
+        return_content: true
+      register: health_check
+      until: >-
+        health_check.status == 200 and
+        (health_check.json | default({})).get('status') == 'healthy'
+      retries: 12
+      delay: 5
+
+    - name: Display application health
+      ansible.builtin.debug:
+        var: health_check.json
