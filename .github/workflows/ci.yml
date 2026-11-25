@@ -10,10 +10,19 @@ on:
 permissions:
   contents: read
 
+env:
+  AWS_REGION: ap-south-1
+  ECR_REGISTRY: 910965283858.dkr.ecr.ap-south-1.amazonaws.com
+  ECR_REPOSITORY: cloud-deploy-app
+
 jobs:
   test-and-build:
     runs-on: ubuntu-latest
     timeout-minutes: 15
+
+    permissions:
+      contents: read
+      id-token: write
 
     steps:
       - name: Download repository code
@@ -30,9 +39,29 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -r requirements.txt pytest httpx
 
-      - name: Run health endpoint test
+      - name: Run tests
         working-directory: backend
         run: python -m pytest tests -v
 
       - name: Build Docker image
-        run: docker build -f backend/dockerfile -t cloud-deploy-app:${{ github.sha }} backend
+        run: |
+          docker build -f backend/dockerfile \
+            -t "$ECR_REGISTRY/$ECR_REPOSITORY:$GITHUB_SHA" backend
+
+      - name: Authenticate with AWS using OIDC
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6a4c196c26e071d42e0343502
+        with:
+          role-to-assume: arn:aws:iam::910965283858:role/clouddeploy-github-ecr-role
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Log Docker into ECR
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        run: |
+          aws ecr get-login-password --region "$AWS_REGION" |
+            docker login --username AWS --password-stdin "$ECR_REGISTRY"
+
+      - name: Push image to ECR
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        run: |
+          docker push "$ECR_REGISTRY/$ECR_REPOSITORY:$GITHUB_SHA"
