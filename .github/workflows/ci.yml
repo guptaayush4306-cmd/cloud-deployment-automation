@@ -1,4 +1,4 @@
-name: Application CI
+name: Application CI/CD
 
 on:
   push:
@@ -65,3 +65,115 @@ jobs:
         if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
         run: |
           docker push "$ECR_REGISTRY/$ECR_REPOSITORY:$GITHUB_SHA"
+
+  deploy:
+    needs: test-and-build
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    concurrency:
+      group: ec2-production-deployment
+      cancel-in-progress: false
+
+    permissions:
+      contents: read
+      id-token: write
+
+    env:
+      SECURITY_GROUP_ID: sg-0487a4e6fb5703cab
+      EC2_HOST: ${{ secrets.EC2_HOST }}
+      ANSIBLE_HOST_KEY_CHECKING: "True"
+
+    steps:
+      - name: Download repository code
+        uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Ansible
+        run: |
+          python -m pip install ansible-core
+          ansible-galaxy collection install community.docker
+
+      - name: Authenticate with AWS using OIDC
+        uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6a4c196c26e071d42e0343502
+        with:
+          role-to-assume: arn:aws:iam::910965283858:role/clouddeploy-github-ecr-role
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Prepare SSH and inventory
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.EC2_SSH_KEY }}
+          SSH_KNOWN_HOSTS: ${{ secrets.EC2_KNOWN_HOSTS }}
+        run: |
+          test -n "$EC2_HOST"
+          test -n "$SSH_PRIVATE_KEY"
+          test -n "$SSH_KNOWN_HOSTS"
+
+          install -d -m 700 "$HOME/.ssh"
+          umask 077
+
+          printf '%s\n' "$SSH_PRIVATE_KEY" > "$HOME/.ssh/deploy_key"
+          printf '%s\n' "$SSH_KNOWN_HOSTS" > "$HOME/.ssh/known_hosts"
+
+          printf '[app]\n%s ansible_user=ubuntu ansible_ssh_private_key_file=%s/.ssh/deploy_key ansible_python_interpreter=/usr/bin/python3\n' \
+            "$EC2_HOST" "$HOME" > "$RUNNER_TEMP/inventory.ini"
+
+      - name: Get runner public IP
+        id: runner
+        run: |
+          RUNNER_IP=$(curl --fail --silent --show-error --retry 3 \
+            https://checkip.amazonaws.com)
+
+          python -c 'import ipaddress,sys; ipaddress.IPv4Address(sys.argv[1])' "$RUNNER_IP"
+
+          echo "cidr=$RUNNER_IP/32" >> "$GITHUB_OUTPUT"
+
+      - name: Allow temporary SSH access
+        id: firewall
+        env:
+          RUNNER_CIDR: ${{ steps.runner.outputs.cidr }}
+        run: |
+          RULE_ID=$(aws ec2 authorize-security-group-ingress \
+            --region "$AWS_REGION" \
+            --group-id "$SECURITY_GROUP_ID" \
+            --protocol tcp \
+            --port 22 \
+            --cidr "$RUNNER_CIDR" \
+            --query 'SecurityGroupRules[0].SecurityGroupRuleId' \
+            --output text)
+
+          echo "rule_id=$RULE_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Wait for SSH
+        run: |
+          ansible app -i "$RUNNER_TEMP/inventory.ini" \
+            -m ansible.builtin.wait_for_connection \
+            -a "timeout=120 sleep=5"
+
+      - name: Deploy image and check health
+        run: |
+          ansible-playbook \
+            -i "$RUNNER_TEMP/inventory.ini" \
+            backend/infra/deploy-app.yml \
+            -e "image_tag=$GITHUB_SHA"
+
+      - name: Remove temporary SSH access
+        if: always() && steps.firewall.outputs.rule_id != ''
+        env:
+          RULE_ID: ${{ steps.firewall.outputs.rule_id }}
+        run: |
+          aws ec2 revoke-security-group-ingress \
+            --region "$AWS_REGION" \
+            --group-id "$SECURITY_GROUP_ID" \
+            --security-group-rule-ids "$RULE_ID"
+
+      - name: Remove local SSH files
+        if: always()
+        run: |
+          rm -f "$HOME/.ssh/deploy_key" "$HOME/.ssh/known_hosts"
+          rm -f "$RUNNER_TEMP/inventory.ini"
